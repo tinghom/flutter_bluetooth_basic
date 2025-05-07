@@ -4,7 +4,12 @@ part 'bluetooth_device.g.dart';
 
 @JsonSerializable(includeIfNull: false)
 class BluetoothDevice {
-  BluetoothDevice();
+  BluetoothDevice({
+    this.name,
+    this.address,
+    this.type = 0,
+    this.connected = false,
+  });
 
   String? name;
   String? address;

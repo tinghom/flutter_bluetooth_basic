@@ -15,16 +15,21 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.util.Log;
+
+import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
+import io.flutter.embedding.engine.plugins.activity.ActivityAware;
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
+import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.EventChannel.EventSink;
 import io.flutter.plugin.common.EventChannel.StreamHandler;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
-import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
-import io.flutter.plugin.common.PluginRegistry.Registrar;
 import io.flutter.plugin.common.PluginRegistry.RequestPermissionsResultListener;
 
 import java.util.ArrayList;
@@ -33,313 +38,318 @@ import java.util.List;
 import java.util.Map;
 import java.util.Vector;
 
-/** FlutterBluetoothBasicPlugin */
-public class FlutterBluetoothBasicPlugin implements MethodCallHandler, RequestPermissionsResultListener {
-  private static final String TAG = "BluetoothBasicPlugin";
-  private int id = 0;
-  private ThreadPool threadPool;
-  private static final int REQUEST_COARSE_LOCATION_PERMISSIONS = 1451;
-  private static final String NAMESPACE = "flutter_bluetooth_basic";
-  private final Registrar registrar;
-  private final Activity activity;
-  private final MethodChannel channel;
-  private final EventChannel stateChannel;
-  private final BluetoothManager mBluetoothManager;
-  private BluetoothAdapter mBluetoothAdapter;
+/**
+ * FlutterBluetoothBasicPlugin
+ */
+public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware, RequestPermissionsResultListener, MethodChannel.MethodCallHandler {
+    private static final String TAG = "BluetoothBasicPlugin";
+    private static final String NAMESPACE = "flutter_bluetooth_basic";
+    private static final int REQUEST_PERMISSIONS = 1451;
 
-  private MethodCall pendingCall;
-  private Result pendingResult;
+    private Context applicationContext;
+    private Activity activity;
+    private MethodChannel methodChannel;
+    private EventChannel stateChannel;
 
-  public static void registerWith(Registrar registrar) {
-    final FlutterBluetoothBasicPlugin instance = new FlutterBluetoothBasicPlugin(registrar);
-    registrar.addRequestPermissionsResultListener(instance);
-  }
+    private BluetoothManager bluetoothManager;
+    private BluetoothAdapter bluetoothAdapter;
+    private ScanCallback scanCallback;
+    private EventSink stateSink;
 
-  FlutterBluetoothBasicPlugin(Registrar r){
-    this.registrar = r;
-    this.activity = r.activity();
-    this.channel = new MethodChannel(registrar.messenger(), NAMESPACE + "/methods");
-    this.stateChannel = new EventChannel(registrar.messenger(), NAMESPACE + "/state");
-    this.mBluetoothManager = (BluetoothManager) registrar.activity().getSystemService(Context.BLUETOOTH_SERVICE);
-    this.mBluetoothAdapter = mBluetoothManager.getAdapter();
-    channel.setMethodCallHandler(this);
-    stateChannel.setStreamHandler(stateStreamHandler);
-  }
+    private MethodCall pendingCall;
+    private Result pendingResult;
 
-  @Override
-  public void onMethodCall(MethodCall call, Result result) {
-    if (mBluetoothAdapter == null && !"isAvailable".equals(call.method)) {
-      result.error("bluetooth_unavailable", "Bluetooth is unavailable", null);
-      return;
+    // ThreadPool 與 DeviceConnFactoryManager 相關變數
+    private ThreadPool threadPool;
+    private int connectionId = 0;
+
+    @Override
+    public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
+        // Context 與 Messenger
+        applicationContext = binding.getApplicationContext();
+        setupChannels(binding.getBinaryMessenger(), applicationContext);
     }
 
-    final Map<String, Object> args = call.arguments();
+    private void setupChannels(BinaryMessenger messenger, Context context) {
+        methodChannel = new MethodChannel(messenger, NAMESPACE + "/methods");
+        stateChannel = new EventChannel(messenger, NAMESPACE + "/state");
 
-    switch (call.method){
-      case "state":
-        state(result);
-        break;
-      case "isAvailable":
-        result.success(mBluetoothAdapter != null);
-        break;
-      case "isOn":
-        result.success(mBluetoothAdapter.isEnabled());
-        break;
-      case "isConnected":
-        result.success(threadPool != null);
-        break;
-      case "startScan": {
-        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_COARSE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
-          ActivityCompat.requestPermissions(
-                  activity,
-                  new String[] {Manifest.permission.ACCESS_COARSE_LOCATION},
-                  REQUEST_COARSE_LOCATION_PERMISSIONS);
-          pendingCall = call;
-          pendingResult = result;
-          break;
+        methodChannel.setMethodCallHandler(this);
+        stateChannel.setStreamHandler(stateStreamHandler);
+
+        bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        if (bluetoothManager != null) {
+            bluetoothAdapter = bluetoothManager.getAdapter();
         }
-        startScan(call, result);
-        break;
-      }
-      case "stopScan":
-        stopScan();
-        result.success(null);
-        break;
-      case "connect":
-        connect(result, args);
-        break;
-      case "disconnect":
-        result.success(disconnect());
-        break;
-      case "destroy":
-        result.success(destroy());
-        break;
-      case "writeData":
-        writeData(result, args);
-        break;
-      default:
-        result.notImplemented();
-        break;
+
+        // 定義掃描回呼
+        scanCallback = new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                BluetoothDevice device = result.getDevice();
+                if (device != null && device.getName() != null) {
+                    invokeMethodOnUiThread("ScanResult", device);
+                }
+            }
+        };
     }
 
-  }
-
-  private void getDevices(Result result){
-    List<Map<String, Object>> devices = new ArrayList<>();
-    for (BluetoothDevice device : mBluetoothAdapter.getBondedDevices()) {
-      Map<String, Object> ret = new HashMap<>();
-      ret.put("address", device.getAddress());
-      ret.put("name", device.getName());
-      ret.put("type", device.getType());
-      devices.add(ret);
+    @Override
+    public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        methodChannel.setMethodCallHandler(null);
+        stateChannel.setStreamHandler(null);
+        methodChannel = null;
+        stateChannel = null;
+        applicationContext = null;
     }
 
-    result.success(devices);
-  }
-
-  private void state(Result result){
-    try {
-      switch(mBluetoothAdapter.getState()) {
-        case BluetoothAdapter.STATE_OFF:
-          result.success(BluetoothAdapter.STATE_OFF);
-          break;
-        case BluetoothAdapter.STATE_ON:
-          result.success(BluetoothAdapter.STATE_ON);
-          break;
-        case BluetoothAdapter.STATE_TURNING_OFF:
-          result.success(BluetoothAdapter.STATE_TURNING_OFF);
-          break;
-        case BluetoothAdapter.STATE_TURNING_ON:
-          result.success(BluetoothAdapter.STATE_TURNING_ON);
-          break;
-        default:
-          result.success(0);
-          break;
-      }
-    } catch (SecurityException e) {
-      result.error("invalid_argument", "Argument 'address' not found", null);
+    @Override
+    public void onAttachedToActivity(@NonNull ActivityPluginBinding binding) {
+        activity = binding.getActivity();
+        binding.addRequestPermissionsResultListener(this);
     }
 
-  }
-
-  private void startScan(MethodCall call, Result result) {
-    Log.d(TAG,"start scan ");
-
-    try {
-      startScan();
-      result.success(null);
-    } catch (Exception e) {
-      result.error("startScan", e.getMessage(), null);
+    @Override
+    public void onDetachedFromActivityForConfigChanges() {
+        activity = null;
     }
-  }
 
-  private void invokeMethodUIThread(final String name, final BluetoothDevice device) {
-    final Map<String, Object> ret = new HashMap<>();
-    ret.put("address", device.getAddress());
-    ret.put("name", device.getName());
-    ret.put("type", device.getType());
+    @Override
+    public void onReattachedToActivityForConfigChanges(@NonNull ActivityPluginBinding binding) {
+        activity = binding.getActivity();
+        binding.addRequestPermissionsResultListener(this);
+    }
 
-    activity.runOnUiThread(
-            new Runnable() {
-              @Override
-              public void run() {
-                channel.invokeMethod(name, ret);
-              }
+    @Override
+    public void onDetachedFromActivity() {
+        activity = null;
+    }
+
+    @Override
+    public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQUEST_PERMISSIONS) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                // 使用先前的呼叫與結果
+                startScan(pendingCall, pendingResult);
+            } else {
+                pendingResult.error("no_permissions", "需要權限以執行掃描", null);
+                pendingResult = null;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
+        if (bluetoothAdapter == null && !"isAvailable".equals(call.method)) {
+            result.error("bluetooth_unavailable", "Bluetooth 無法使用", null);
+            return;
+        }
+
+        Map<String, Object> args = call.arguments();
+        switch (call.method) {
+            case "state":
+                getState(result);
+                break;
+            case "isAvailable":
+                result.success(bluetoothAdapter != null);
+                break;
+            case "isOn":
+                result.success(bluetoothAdapter.isEnabled());
+                break;
+            case "startScan":
+                requestScanPermissions(call, result);
+                break;
+            case "stopScan":
+                stopScan();
+                result.success(null);
+                break;
+            case "connect":
+                connectDevice(result, args);
+                break;
+            case "disconnect":
+                result.success(disconnectDevice());
+                break;
+            case "destroy":
+                result.success(destroyConnection());
+                break;
+            case "writeData":
+                writeData(result, args);
+                break;
+            default:
+                result.notImplemented();
+                break;
+        }
+    }
+
+    /**
+     * 請求掃描所需權限
+     */
+    private void requestScanPermissions(MethodCall call, Result result) {
+        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(activity,
+                    new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION},
+                    REQUEST_PERMISSIONS);
+            pendingCall = call;
+            pendingResult = result;
+        } else {
+            startScan(call, result);
+        }
+    }
+
+    /**
+     * 開始 BLE 掃描
+     */
+    private void startScan(MethodCall call, Result result) {
+        try {
+            BluetoothLeScanner scanner = bluetoothAdapter.getBluetoothLeScanner();
+            if (scanner == null) throw new IllegalStateException("Adapter 未開啟，無法掃描");
+            ScanSettings settings = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build();
+            scanner.startScan(null, settings, scanCallback);
+            result.success(null);
+        } catch (Exception e) {
+            result.error("startScan_error", e.getMessage(), null);
+        }
+    }
+
+    /**
+     * 停止 BLE 掃描
+     */
+    private void stopScan() {
+        BluetoothLeScanner scanner = bluetoothAdapter.getBluetoothLeScanner();
+        if (scanner != null) {
+            scanner.stopScan(scanCallback);
+        }
+    }
+
+    /**
+     * 呼叫 UI 執行方法
+     */
+    private void invokeMethodOnUiThread(final String methodName, final BluetoothDevice device) {
+        if (activity == null) return;
+        Map<String, Object> resultMap = new HashMap<>();
+        resultMap.put("address", device.getAddress());
+        resultMap.put("name", device.getName());
+        resultMap.put("type", device.getType());
+        activity.runOnUiThread(() -> methodChannel.invokeMethod(methodName, resultMap));
+    }
+
+    /**
+     * 取得目前 Bluetooth 狀態
+     */
+    private void getState(Result result) {
+        try {
+            int state = bluetoothAdapter.getState();
+            result.success(state);
+        } catch (SecurityException e) {
+            result.error("state_error", "取得狀態失敗", null);
+        }
+    }
+
+    /**
+     * 連線裝置
+     */
+    private void connectDevice(Result result, Map<String, Object> args) {
+        if (args.containsKey("address")) {
+            String macAddress = (String) args.get("address");
+            disconnectDevice();
+            new DeviceConnFactoryManager.Build()
+                    .setId(connectionId)
+                    .setConnMethod(DeviceConnFactoryManager.CONN_METHOD.BLUETOOTH)
+                    .setMacAddress(macAddress)
+                    .build();
+            threadPool = ThreadPool.getInstantiation();
+            threadPool.addSerialTask(() -> DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].openPort());
+            result.success(true);
+        } else {
+            result.error("invalid_arg", "缺少 address 參數", null);
+        }
+    }
+
+    /**
+     * 中斷連線
+     */
+    private boolean disconnectDevice() {
+        if (DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId] != null
+                && DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].mPort != null) {
+            DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].reader.cancel();
+            DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].mPort.closePort();
+            DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].mPort = null;
+        }
+        return true;
+    }
+
+    /**
+     * 終結所有資源
+     */
+    private boolean destroyConnection() {
+        DeviceConnFactoryManager.closeAllPort();
+        if (threadPool != null) {
+            threadPool.stopThreadPool();
+        }
+        return true;
+    }
+
+    /**
+     * 寫入資料
+     */
+    @SuppressWarnings("unchecked")
+    private void writeData(Result result, Map<String, Object> args) {
+        if (args.containsKey("bytes")) {
+            ArrayList<Integer> byteList = (ArrayList<Integer>) args.get("bytes");
+            threadPool = ThreadPool.getInstantiation();
+            threadPool.addSerialTask(() -> {
+                Vector<Byte> dataVector = new Vector<>();
+                for (int val : byteList) {
+                    dataVector.add((byte) (val > 127 ? val - 256 : val));
+                }
+                DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].sendDataImmediately(dataVector);
             });
-  }
-
-  private ScanCallback mScanCallback = new ScanCallback() {
-    @Override
-    public void onScanResult(int callbackType, ScanResult result) {
-      BluetoothDevice device = result.getDevice();
-      if(device != null && device.getName() != null){
-        invokeMethodUIThread("ScanResult", device);
-      }
+            result.success(null);
+        } else {
+            result.error("bytes_empty", "Bytes 參數為空", null);
+        }
     }
-  };
 
-  private void startScan() throws IllegalStateException {
-    BluetoothLeScanner scanner = mBluetoothAdapter.getBluetoothLeScanner();
-    if(scanner == null) throw new IllegalStateException("getBluetoothLeScanner() is null. Is the Adapter on?");
+    /**
+     * 監聽 Bluetooth 狀態與連線事件
+     */
+    private final StreamHandler stateStreamHandler = new StreamHandler() {
+        private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                Log.d(TAG, "StateReceiver action: " + action);
+                if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
+                    stateSink.success(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1));
+                } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
+                    stateSink.success(1);
+                } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
+                    stateSink.success(0);
+                }
+            }
+        };
 
-    // 0:lowPower 1:balanced 2:lowLatency -1:opportunistic
-    ScanSettings settings = new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build();
-    scanner.startScan(null, settings, mScanCallback);
-  }
-
-  private void stopScan() {
-    BluetoothLeScanner scanner = mBluetoothAdapter.getBluetoothLeScanner();
-    if(scanner != null) scanner.stopScan(mScanCallback);
-  }
-
-  private void connect(Result result, Map<String, Object> args) {
-    if (args.containsKey("address")) {
-      String address = (String) args.get("address");
-      disconnect();
-
-      new DeviceConnFactoryManager.Build()
-              .setId(id)
-              // Set the connection method
-              .setConnMethod(DeviceConnFactoryManager.CONN_METHOD.BLUETOOTH)
-              // Set the connected Bluetooth mac address
-              .setMacAddress(address)
-              .build();
-      // Open port
-      threadPool = ThreadPool.getInstantiation();
-      threadPool.addSerialTask(new Runnable() {
         @Override
-        public void run() {
-          DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].openPort();
+        public void onListen(Object arguments, EventSink events) {
+            stateSink = events;
+            IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+            filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+            filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+            if (activity != null) {
+                activity.registerReceiver(stateReceiver, filter);
+            }
         }
-      });
 
-      result.success(true);
-    } else {
-      result.error("invalid_argument", "Argument 'address' not found", null);
-    }
-
-  }
-
-  /**
-   * Reconnect to recycle the last connected object to avoid memory leaks
-   */
-  private boolean disconnect(){
-
-    if(DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id]!=null&&DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].mPort!=null) {
-      DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].reader.cancel();
-      DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].mPort.closePort();
-      DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].mPort=null;
-    }
-    return true;
-  }
-
-  private boolean destroy() {
-    DeviceConnFactoryManager.closeAllPort();
-    if (threadPool != null) {
-      threadPool.stopThreadPool();
-    }
-
-    return true;
-  }
-
-  @SuppressWarnings("unchecked")
-  private void writeData(Result result, Map<String, Object> args) {
-    if (args.containsKey("bytes")) {
-      final ArrayList<Integer> bytes = (ArrayList<Integer>)args.get("bytes");
-
-      threadPool = ThreadPool.getInstantiation();
-      threadPool.addSerialTask(new Runnable() {
         @Override
-        public void run() {
-          Vector<Byte> vectorData = new Vector<>();
-          for(int i = 0; i < bytes.size(); ++i) {
-            Integer val = bytes.get(i);
-            vectorData.add(Byte.valueOf( Integer.toString(val > 127 ? val-256 : val ) ));
-          }
-
-          DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].sendDataImmediately(vectorData);
+        public void onCancel(Object arguments) {
+            if (activity != null) {
+                activity.unregisterReceiver(stateReceiver);
+            }
+            stateSink = null;
         }
-      });
-    } else {
-      result.error("bytes_empty", "Bytes param is empty", null);
-    }
-  }
-
-  @Override
-  public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-
-    if (requestCode == REQUEST_COARSE_LOCATION_PERMISSIONS) {
-      if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-        startScan(pendingCall, pendingResult);
-      } else {
-        pendingResult.error("no_permissions", "This app requires location permissions for scanning", null);
-        pendingResult = null;
-      }
-      return true;
-    }
-    return false;
-
-  }
-
-  private final StreamHandler stateStreamHandler = new StreamHandler() {
-    private EventSink sink;
-
-    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
-      @Override
-      public void onReceive(Context context, Intent intent) {
-        final String action = intent.getAction();
-        Log.d(TAG, "stateStreamHandler, current action: " + action);
-
-        if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
-          threadPool = null;
-          sink.success(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1));
-        } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
-          sink.success(1);
-        } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-          threadPool = null;
-          sink.success(0);
-        }
-      }
     };
-
-    @Override
-    public void onListen(Object o, EventSink eventSink) {
-      sink = eventSink;
-      IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
-      filter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
-      filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
-      filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
-      activity.registerReceiver(mReceiver, filter);
-    }
-
-    @Override
-    public void onCancel(Object o) {
-      sink = null;
-      activity.unregisterReceiver(mReceiver);
-    }
-  };
-
-
-
 }
