@@ -318,20 +318,50 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
      */
     @SuppressWarnings("unchecked")
     private void writeData(Result result, Map<String, Object> args) {
-        if (args.containsKey("bytes")) {
-            ArrayList<Integer> byteList = (ArrayList<Integer>) args.get("bytes");
-            threadPool = ThreadPool.getInstantiation();
-            threadPool.addSerialTask(() -> {
-                Vector<Byte> dataVector = new Vector<>();
-                for (int val : byteList) {
-                    dataVector.add((byte) (val > 127 ? val - 256 : val));
-                }
-                DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].sendDataImmediately(dataVector);
-            });
-            result.success(null);
-        } else {
-            result.error("bytes_empty", "Bytes 參數為空", null);
+        if (! args.containsKey("bytes")) {
+            result.error("invalid_arg", "缺少 bytes 參數", null);
+            return;
         }
+
+        ArrayList<Integer> byteList;
+        try {
+             byteList = (ArrayList<Integer>) args.get("bytes");
+             if (byteList == null || byteList.isEmpty()) {
+                 result.error("bytes_empty", "Bytes 參數為空或列表為空", null);
+                 return;
+             }
+        } catch (ClassCastException e) {
+             result.error("invalid_arg_type", "bytes 參數格式不正確，應為 List<int>", null);
+             return;
+        }
+
+        Vector<Byte> dataVector = new Vector<>(byteList.size());
+        try {
+            for (int val : byteList) {
+                if (val < 0 || val > 255) {
+                    result.error("invalid_byte_value", "Bytes 參數包含無效的位元組值 (超出 0-255 範圍)", null);
+                    return;
+                }
+                // 將無符號整數 (0-255) 轉換為 Java 有符號位元組 (-128 到 127)
+                dataVector.add((byte) (val > 127 ? val - 256 : val));
+            }
+        } catch (Exception e) {
+            result.error("data_conversion_error", "資料轉換失敗: " + e.getMessage(), null);
+            return;
+        }
+
+
+        threadPool = ThreadPool.getInstantiation();
+        threadPool.addSerialTask(() -> {
+            // 這個 Runnable 中的程式碼會在背景執行緒中執行
+            if (DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId] != null) {
+                DeviceConnFactoryManager.getDeviceConnFactoryManagers()[connectionId].sendDataImmediately(dataVector);
+            } else {
+                Log.e(TAG, "Device connection manager is null, cannot send data.");
+            }
+        });
+
+        result.success(null);
     }
 
     /**
