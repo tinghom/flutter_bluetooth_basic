@@ -4,17 +4,19 @@ version '1.0'
 buildscript {
     repositories {
         google()
+        mavenCentral()
         jcenter()
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:3.5.0'
+        classpath 'com.android.tools.build:gradle:8.9.2'
     }
 }
 
 rootProject.allprojects {
     repositories {
         google()
+        mavenCentral()
         jcenter()
     }
 }
@@ -25,7 +27,7 @@ android {
     if (project.android.hasProperty("namespace")) {
         namespace 'com.tablemi.flutter_bluetooth_basic'
     }
-    compileSdkVersion 28
+    compileSdkVersion 34
 
     defaultConfig {
         minSdkVersion 21
@@ -33,6 +35,11 @@ android {
     }
     lintOptions {
         disable 'InvalidPackage'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 }
 
