@@ -99,6 +99,24 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
     }
 
     @Override
+    public boolean onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        if (requestCode == REQUEST_PERMISSIONS) {
+            if (pendingCall != null && pendingResult != null) {
+                if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    startScan(pendingCall, pendingResult);
+                } else {
+                    pendingResult.error("permission_denied", "所需的藍牙或位置權限被拒絕", null);
+                }
+                pendingCall = null;
+                pendingResult = null;
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
     public void onDetachedFromActivityForConfigChanges() {
         activity = null;
     }
