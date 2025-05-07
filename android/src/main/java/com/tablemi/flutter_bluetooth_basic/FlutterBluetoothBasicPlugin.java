@@ -59,13 +59,11 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
     private MethodCall pendingCall;
     private Result pendingResult;
 
-    // ThreadPool 與 DeviceConnFactoryManager 相關變數
     private ThreadPool threadPool;
     private int connectionId = 0;
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-        // Context 與 Messenger
         applicationContext = binding.getApplicationContext();
         setupChannels(binding.getBinaryMessenger(), applicationContext);
     }
@@ -82,16 +80,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
             bluetoothAdapter = bluetoothManager.getAdapter();
         }
 
-        // 定義掃描回呼
-        scanCallback = new ScanCallback() {
-            @Override
-            public void onScanResult(int callbackType, ScanResult result) {
-                BluetoothDevice device = result.getDevice();
-                if (device != null && device.getName() != null) {
-                    invokeMethodOnUiThread("ScanResult", device);
-                }
-            }
-        };
+        scanCallback = createScanCallback();
     }
 
     @Override
@@ -123,21 +112,6 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
     @Override
     public void onDetachedFromActivity() {
         activity = null;
-    }
-
-    @Override
-    public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == REQUEST_PERMISSIONS) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                // 使用先前的呼叫與結果
-                startScan(pendingCall, pendingResult);
-            } else {
-                pendingResult.error("no_permissions", "需要權限以執行掃描", null);
-                pendingResult = null;
-            }
-            return true;
-        }
-        return false;
     }
 
     @Override
@@ -184,18 +158,46 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
     }
 
     /**
-     * 請求掃描所需權限
+     * 请求扫描所需权限（适配Android 12+蓝牙权限）
      */
     private void requestScanPermissions(MethodCall call, Result result) {
-        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(activity,
-                    new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION},
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            // Android 12+ 需要BLUETOOTH_SCAN权限
+            if (ContextCompat.checkSelfPermission(activity, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(activity,
+                    new String[]{Manifest.permission.BLUETOOTH_SCAN},
                     REQUEST_PERMISSIONS);
-            pendingCall = call;
-            pendingResult = result;
+                pendingCall = call;
+                pendingResult = result;
+                return;
+            }
         } else {
-            startScan(call, result);
+            // 旧版本使用定位权限
+            if (ContextCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(activity,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    REQUEST_PERMISSIONS);
+                pendingCall = call;
+                pendingResult = result;
+                return;
+            }
         }
+        startScan(call, result);
+    }
+
+    /**
+     * 创建扫描回调
+     */
+    private ScanCallback createScanCallback() {
+        return new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                BluetoothDevice device = result.getDevice();
+                if (device != null && device.getName() != null) {
+                    invokeMethodOnUiThread("ScanResult", device);
+                }
+            }
+        };
     }
 
     /**
@@ -315,41 +317,50 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
     }
 
     /**
-     * 監聽 Bluetooth 狀態與連線事件
+     * 创建状态流处理器
      */
-    private final StreamHandler stateStreamHandler = new StreamHandler() {
-        private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                String action = intent.getAction();
-                Log.d(TAG, "StateReceiver action: " + action);
-                if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
-                    stateSink.success(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1));
-                } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
-                    stateSink.success(1);
-                } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
-                    stateSink.success(0);
-                }
-            }
-        };
+    private StreamHandler createStateStreamHandler() {
+        return new StreamHandler() {
+            private BroadcastReceiver stateReceiver;
 
-        @Override
-        public void onListen(Object arguments, EventSink events) {
-            stateSink = events;
-            IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
-            filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
-            filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
-            if (activity != null) {
+            @Override
+            public void onListen(Object arguments, EventSink events) {
+                stateSink = events;
+                stateReceiver = new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        handleBluetoothStateChange(intent, events);
+                    }
+                };
+
+                IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+                filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+                filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
                 activity.registerReceiver(stateReceiver, filter);
             }
-        }
 
-        @Override
-        public void onCancel(Object arguments) {
-            if (activity != null) {
-                activity.unregisterReceiver(stateReceiver);
+            @Override
+            public void onCancel(Object arguments) {
+                if (stateReceiver != null) {
+                    activity.unregisterReceiver(stateReceiver);
+                }
+                stateSink = null;
             }
-            stateSink = null;
+        };
+    }
+
+    /**
+     * 处理蓝牙状态变化
+     */
+    private void handleBluetoothStateChange(Intent intent, EventSink sink) {
+        String action = intent.getAction();
+        if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)) {
+            sink.success(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1));
+        } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
+            sink.success(1);
+        } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
+            sink.success(0);
         }
-    };
+    }
+
 }
