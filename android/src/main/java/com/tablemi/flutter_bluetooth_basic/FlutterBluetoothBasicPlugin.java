@@ -73,7 +73,7 @@ public class FlutterBluetoothBasicPlugin implements FlutterPlugin, ActivityAware
         stateChannel = new EventChannel(messenger, NAMESPACE + "/state");
 
         methodChannel.setMethodCallHandler(this);
-        stateChannel.setStreamHandler(stateStreamHandler);
+        stateChannel.setStreamHandler(createStateStreamHandler());
 
         bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         if (bluetoothManager != null) {
